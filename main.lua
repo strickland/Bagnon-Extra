@@ -40,6 +40,17 @@
 	  Bagnonium was formerly named Combuctor, so its legacy prefix is
 	  included as a fallback in case any frame names still carry it.
 
+	  NOTE: only "ContainerItem" and "BankItem" have been confirmed
+	  against real Bagnon frame names (e.g. BagnonContainerItem126).
+	  "ReagentItem" and "VaultItem" are educated guesses at naming and
+	  have NOT been confirmed to exist as real Bagnon/Bagnonium frame
+	  prefixes -- reagent bank slots may simply be numbered as part of
+	  BankItem instead. They're harmless if wrong (see the fast-path
+	  check in QueueButtonsForForceScan below, which just finds nothing
+	  and moves on), but run "/bagnonextra" in-game to see exactly which
+	  prefixes resolve to real buttons on your client before assuming
+	  reagent bank / warband bank items are actually being covered.
+
 	- We read buttons directly (button.bag / button:GetID()) rather
 	  than through Bagnon/Bagnonium's internal plugin classes, since
 	  those class names have shifted across versions and skins.
@@ -66,6 +77,17 @@
 	  would get tinted using an unrelated item from your own bags at
 	  the same bag/slot number.
 
+	- The main bank container's slots are special "inventory slots"
+	  under the hood, handled via SetInventoryItem/BankButtonIDToInvSlotID
+	  instead of SetBagItem (see ScanTooltip). This was accurate for the
+	  pre-Dragonflight bank. Blizzard has since reworked the retail bank
+	  so that its tabs behave like ordinary bag containers; it's not
+	  confirmed whether the old inventory-slot special case still ever
+	  triggers on current retail, or whether it's now dead code. Turn on
+	  debug mode ("/bagnonextra debug") and open your bank once to see
+	  which branch actually fires on your client -- do this before
+	  assuming bank-item detection works correctly on retail.
+
 	- Performance: scanning an item's tooltip is the expensive part of
 	  this addon. Each button caches a lightweight numeric fingerprint
 	  of its current item (no table allocation) and only does the real
@@ -77,6 +99,19 @@
 	  nothing when bags are sitting idle. The profession/class-token
 	  checks are skipped entirely (no extra cost at all) unless
 	  Bagnonium-without-Bagnon is actually detected.
+
+	  Forced rescans (the kind that skip the fingerprint cache and
+	  re-scan every visible item's tooltip) are spread across multiple
+	  frames in small chunks rather than done in one synchronous pass.
+	  A single-frame full rescan is cheap enough to be invisible on
+	  Classic/SoD/MoP (fewer bag slots, short tooltips), but on retail
+	  the combination of more total slots (backpack + 4 bags + the
+	  dedicated reagent bag) and much longer per-item tooltips (item
+	  level, crafted stats, sockets, set bonuses, upgrade track, etc.)
+	  can turn one synchronous forced rescan into a visible CPU peak the
+	  instant you open your bags, even though total/sustained addon CPU
+	  stays low. Chunking the same work across several frames keeps the
+	  total cost identical but removes the single-frame spike.
 ]]
 
 local hasBagnon = _G.Bagnon ~= nil
@@ -111,10 +146,18 @@ local PROFESSION_CLASS_ID = Enum and Enum.ItemClass and Enum.ItemClass.Professio
 local ARMOR_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Armor) or 4
 local WEAPON_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Weapon) or 2
 local MISC_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Miscellaneous) or 15
-local MOUNT_SUBCLASS_ID = 5 -- Enum.ItemSubclass.Miscellaneous.Mount, but that enum path isn't reliably exposed; the numeric ID is stable
-local PET_SUBCLASS_ID = 2 -- companion pets
+
+-- Prefer the named Enum over hardcoded numeric literals, same pattern
+-- already used above for RECIPE/ARMOR/WEAPON/MISC class IDs. Guards
+-- against these subclass numbers ever diverging between client
+-- generations (older DBC-era item data has been observed with
+-- different numbering than the modern Enum table uses), and self-
+-- documents intent better than a bare magic number.
+local MOUNT_SUBCLASS_ID = (Enum and Enum.ItemMiscellaneousSubclass and Enum.ItemMiscellaneousSubclass.Mount) or 5
+local PET_SUBCLASS_ID = (Enum and Enum.ItemMiscellaneousSubclass and Enum.ItemMiscellaneousSubclass.CompanionPet) or 2
 
 local SAFETY_NET_INTERVAL = 1.0 -- seconds between cache-only safety-net passes
+local FORCE_SCAN_CHUNK_SIZE = 25 -- buttons processed per frame during a forced rescan; keeps a big bag opening from spiking CPU in a single frame
 
 -- Blizzard colors a tooltip requirement line (profession, zone, faction,
 -- level, etc.) red when you don't meet it, and white/normal when you do.
@@ -125,6 +168,24 @@ local SAFETY_NET_INTERVAL = 1.0 -- seconds between cache-only safety-net passes
 local REQUIREMENT_RED_MIN_R = 0.75
 local REQUIREMENT_RED_MAX_G = 0.35
 local REQUIREMENT_RED_MAX_B = 0.35
+
+-----------------------------------------------------------
+-- Debug mode: "/bagnonextra" prints which button prefixes resolve to
+-- real buttons on your client (use this to check whether ReagentItem/
+-- VaultItem are real or just unused guesses). "/bagnonextra debug"
+-- toggles verbose logging, including which branch ScanTooltip takes
+-- for main-bank slots (SetInventoryItem vs SetBagItem) -- use this to
+-- check the retail bank-rework question noted above.
+-----------------------------------------------------------
+
+local DebugMode = false
+local bankBranchLogged = false
+
+local function DebugPrint(msg)
+	if DebugMode then
+		print("|cff33ff99BagnonExtra:|r " .. msg)
+	end
+end
 
 -- Item buttons across Bagnon/Bagnonium's windows follow this
 -- "<Prefix><index>" naming scheme.
@@ -142,7 +203,7 @@ if hasBagnonium then
 	AddPrefixSet("Bagnonium")
 	AddPrefixSet("Combuctor") -- Bagnonium's former name; hedges against leftover frame names
 end
-local MAX_BUTTONS_PER_PREFIX = 220 -- generous ceiling; scanning stops early once a gap is found
+local MAX_BUTTONS_PER_PREFIX = 300 -- generous ceiling (padded for retail's larger bag/bank/reagent-bank slot counts); scanning stops early once a gap is found
 
 -----------------------------------------------------------
 -- Scanning tooltip (hidden, used only to read tooltip text)
@@ -367,11 +428,22 @@ local function ScanTooltip(bag, slot)
 	-- The main bank container's slots are technically special
 	-- "inventory slots" under the hood (the same category as equipped
 	-- gear), not real bag slots -- so GameTooltip:SetBagItem silently
-	-- returns an empty tooltip for them. They need to go through
-	-- SetInventoryItem instead, with the slot number converted via
-	-- BankButtonIDToInvSlotID. Extra bank BAGS (positive IDs) are real
-	-- containers and work fine through the normal SetBagItem path.
+	-- returns an empty tooltip for them on the pre-Dragonflight bank.
+	-- They need to go through SetInventoryItem instead, with the slot
+	-- number converted via BankButtonIDToInvSlotID. Extra bank BAGS
+	-- (positive IDs) are real containers and work fine through the
+	-- normal SetBagItem path.
+	--
+	-- Blizzard has since reworked the retail bank so its tabs behave
+	-- like ordinary bag containers; it hasn't been confirmed whether
+	-- this branch still ever fires there, or whether it's dead code on
+	-- current retail. Run "/bagnonextra debug" and open your bank once
+	-- to see which branch actually fires for you.
 	if bag == (_G.BANK_CONTAINER or -1) and _G.BankButtonIDToInvSlotID then
+		if DebugMode and not bankBranchLogged then
+			bankBranchLogged = true
+			DebugPrint("main bank slot detected -> using SetInventoryItem/BankButtonIDToInvSlotID branch (bag=" .. tostring(bag) .. ")")
+		end
 		Scanner:SetInventoryItem("player", BankButtonIDToInvSlotID(slot))
 	else
 		Scanner:SetBagItem(bag, slot)
@@ -388,8 +460,15 @@ local knownProfessions = {}
 
 local function RefreshKnownProfessions()
 	wipe(knownProfessions)
-	local prof1, prof2, _archaeology, fishing, cooking = GetProfessions()
-	for _, index in ipairs({ prof1, prof2, fishing, cooking }) do
+	-- GetProfessions() returns prof1, prof2, archaeology, fishing,
+	-- cooking, firstAid on Classic (Era/SoD/MoP Classic all included);
+	-- firstAid must be captured explicitly or First Aid recipes will
+	-- be wrongly flagged as "unknown profession" even when learned.
+	-- Retail's GetProfessions() simply returns nil for the trailing
+	-- firstAid slot (First Aid was removed in Shadowlands), so this is
+	-- safe to always capture.
+	local prof1, prof2, _archaeology, fishing, cooking, firstAid = GetProfessions()
+	for _, index in ipairs({ prof1, prof2, fishing, cooking, firstAid }) do
 		if index then
 			local name = GetProfessionInfo(index)
 			if name then
@@ -701,12 +780,16 @@ end
 -- Scan all known item buttons across whichever addon(s) are loaded
 -----------------------------------------------------------
 
-local function ScanAllButtons(force)
+-- Cheap, non-forced pass: used by the once-a-second safety net. Each
+-- button's own fingerprint check inside UpdateButton means this costs
+-- almost nothing when nothing has changed, so it's fine to run this
+-- synchronously in one pass rather than chunking it.
+local function ScanAllButtonsCached()
 	for _, prefix in ipairs(BUTTON_PREFIXES) do
 		-- Fast path: if this window's first button isn't visible, the
 		-- whole window is closed (all its buttons share the same
 		-- parent frame), so there's nothing here worth walking. This
-		-- turns the common "bags are closed" case from up to 220
+		-- turns the common "bags are closed" case from up to N
 		-- per-button lookups+calls into a single check, which is what
 		-- was keeping CPU usage nonzero even with bags shut -- every
 		-- scan (including the once-a-second safety net) was still
@@ -725,13 +808,120 @@ local function ScanAllButtons(force)
 			for i = 1, MAX_BUTTONS_PER_PREFIX do
 				local button = _G[prefix .. i]
 				if button then
-					UpdateButton(button, force)
+					UpdateButton(button, false)
 				else
 					break -- buttons are created sequentially; a gap means we've reached the end
 				end
 			end
 		end
 	end
+end
+
+-----------------------------------------------------------
+-- Forced rescan queue -- unlike the cached pass above, a forced
+-- rescan does a full tooltip scan on every visible item regardless of
+-- whether it changed, which is the expensive path. Doing that for an
+-- entire open bag window synchronously in one frame is what produces
+-- the CPU "spike" on clients with many slots and/or long tooltips
+-- (retail, mainly, thanks to the reagent bag adding a slot category
+-- Classic doesn't have and much longer per-item tooltip text). This
+-- queue spreads the same total work across multiple frames instead,
+-- processing a small chunk per tick via C_Timer.After(0, ...).
+-----------------------------------------------------------
+
+local forceScanQueue = {}
+local forceScanQueueActive = false
+
+local function ProcessForceScanChunk()
+	local processed = 0
+	while processed < FORCE_SCAN_CHUNK_SIZE do
+		local button = table.remove(forceScanQueue)
+		if not button then
+			forceScanQueueActive = false
+			DebugPrint("forced rescan complete")
+			return
+		end
+		UpdateButton(button, true)
+		processed = processed + 1
+	end
+
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, ProcessForceScanChunk)
+	else
+		-- No timer API available (very old client): just finish the
+		-- rest synchronously rather than dropping the remaining work.
+		while #forceScanQueue > 0 do
+			UpdateButton(table.remove(forceScanQueue), true)
+		end
+		forceScanQueueActive = false
+	end
+end
+
+local function QueueButtonsForForceScan()
+	wipe(forceScanQueue)
+	for _, prefix in ipairs(BUTTON_PREFIXES) do
+		local firstButton = _G[prefix .. "1"]
+		if firstButton and firstButton:IsVisible() then
+			for i = 1, MAX_BUTTONS_PER_PREFIX do
+				local button = _G[prefix .. i]
+				if button then
+					table.insert(forceScanQueue, button)
+				else
+					break
+				end
+			end
+		end
+	end
+
+	DebugPrint(("forced rescan queued: %d buttons"):format(#forceScanQueue))
+
+	if #forceScanQueue == 0 then
+		return
+	end
+
+	if forceScanQueueActive then
+		-- A chunked scan from a previous burst is still draining;
+		-- ProcessForceScanChunk will simply keep consuming from the
+		-- freshly-repopulated queue, so there's no need to kick off a
+		-- second parallel chain.
+		return
+	end
+
+	forceScanQueueActive = true
+	ProcessForceScanChunk()
+end
+
+-----------------------------------------------------------
+-- Diagnostics slash command
+-----------------------------------------------------------
+
+SLASH_BAGNONEXTRA1 = "/bagnonextra"
+SlashCmdList["BAGNONEXTRA"] = function(msg)
+	msg = (msg or ""):lower():match("^%s*(.-)%s*$")
+
+	if msg == "debug" then
+		DebugMode = not DebugMode
+		print("|cff33ff99BagnonExtra:|r debug mode " .. (DebugMode and "ON" or "OFF"))
+		return
+	end
+
+	print("|cff33ff99BagnonExtra:|r button prefix diagnostics (which of these are real on your client):")
+	for _, prefix in ipairs(BUTTON_PREFIXES) do
+		local count = 0
+		for i = 1, MAX_BUTTONS_PER_PREFIX do
+			if _G[prefix .. i] then
+				count = count + 1
+			else
+				break
+			end
+		end
+		if count > 0 then
+			print(("  %s: %d buttons found"):format(prefix, count))
+		else
+			print(("  %s: none found"):format(prefix))
+		end
+	end
+	print("Use '/bagnonextra debug' to toggle verbose logging (forced rescan queue size, which bank tooltip branch fires).")
 end
 
 -----------------------------------------------------------
@@ -780,22 +970,16 @@ if ENABLE_EXTRA_WARNINGS then
 	RefreshKnownProfessions()
 end
 
--- Stable, reused function references -- avoids allocating a new
--- closure every time an event fires.
-local function CacheScan()
-	ScanAllButtons(false)
-end
-
 local forceScanPending = false
 
 local function RunPendingForceScan()
 	forceScanPending = false
-	ScanAllButtons(true)
+	QueueButtonsForForceScan()
 end
 
 local function RequestForceScan()
 	if not (C_Timer and C_Timer.After) then
-		ScanAllButtons(true) -- no timer API available; just scan immediately
+		QueueButtonsForForceScan() -- no timer API available; just scan immediately (still chunked-if-possible internally)
 		return
 	end
 	if forceScanPending then
@@ -813,7 +997,7 @@ eventFrame:SetScript("OnEvent", function(self, event)
 end)
 
 if C_Timer and C_Timer.NewTicker then
-	C_Timer.NewTicker(SAFETY_NET_INTERVAL, CacheScan)
+	C_Timer.NewTicker(SAFETY_NET_INTERVAL, ScanAllButtonsCached)
 else
 	-- Very old clients without C_Timer: fall back to a throttled
 	-- OnUpdate (rare; modern retail and classic both have C_Timer).
@@ -822,7 +1006,7 @@ else
 		elapsedSinceScan = elapsedSinceScan + elapsed
 		if elapsedSinceScan >= SAFETY_NET_INTERVAL then
 			elapsedSinceScan = 0
-			CacheScan()
+			ScanAllButtonsCached()
 		end
 	end)
 end
