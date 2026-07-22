@@ -1,14 +1,14 @@
 ## Interface: 120007, 120001
-## Interface-Classic: 11508
+## Interface-Classic: 11509
+## Interface-BCC: 20506
+## Interface-Wrath: 38001, 30405
 ## Interface-Mists: 50504
 ## Title: Bagnon Extra
-## Notes: Reddens locked lockboxes/chests, shows item charge counts, pink-tints gear you don't meet the requirement for, labels openable containers "OPN" and learnable mounts/pets/toys "LRN", and (Bagnonium only) tints unknown-profession recipes and class-restricted tokens blue.
 ## Author: Strickland
-## Version: 4.4.0
+## Version: 4.4.1
 ## DefaultState: enabled
 ## LoadOnDemand: 0
 ## OptionalDeps: Bagnon, Bagnonium
 ## X-Category: Inventory
-main.lua
 
 
