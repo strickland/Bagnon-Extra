@@ -5,7 +5,7 @@
 ## Interface-Mists: 50504
 ## Title: Bagnon Extra
 ## Author: Strickland
-## Version: 4.4.1
+## Version: 1.1
 ## DefaultState: enabled
 ## LoadOnDemand: 0
 ## OptionalDeps: Bagnon, Bagnonium
