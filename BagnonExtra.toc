@@ -10,5 +10,6 @@
 ## LoadOnDemand: 0
 ## OptionalDeps: Bagnon, Bagnonium
 ## X-Category: Inventory
+main.lua
 
 
