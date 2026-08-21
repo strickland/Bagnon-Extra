@@ -460,21 +460,62 @@ local knownProfessions = {}
 
 local function RefreshKnownProfessions()
 	wipe(knownProfessions)
-	-- GetProfessions() returns prof1, prof2, archaeology, fishing,
-	-- cooking, firstAid on Classic (Era/SoD/MoP Classic all included);
-	-- firstAid must be captured explicitly or First Aid recipes will
-	-- be wrongly flagged as "unknown profession" even when learned.
-	-- Retail's GetProfessions() simply returns nil for the trailing
-	-- firstAid slot (First Aid was removed in Shadowlands), so this is
-	-- safe to always capture.
-	local prof1, prof2, _archaeology, fishing, cooking, firstAid = GetProfessions()
-	for _, index in ipairs({ prof1, prof2, fishing, cooking, firstAid }) do
+
+	-- Primary source: GetProfessions()'s own two primary-profession
+	-- slots. Read defensively with select()/a numeric loop rather than
+	-- destructuring into fixed locals or looping with ipairs(), since
+	-- neither the count nor the order of trailing slots (archaeology,
+	-- fishing, cooking, firstAid) is guaranteed identical across every
+	-- client flavor, and ipairs() would stop dead at the first nil (e.g.
+	-- a character with only one primary profession leaves prof2 nil,
+	-- which sits before fishing/cooking in the list).
+	local numResults = select("#", GetProfessions())
+	local results = { GetProfessions() }
+	for i = 1, numResults do
+		local index = results[i]
 		if index then
 			local name = GetProfessionInfo(index)
 			if name then
 				knownProfessions[name:lower()] = true
 			end
 		end
+	end
+
+	-- Fallback/supplement: walk the character's actual skill list
+	-- (GetNumSkillLines/GetSkillLineInfo -- the same data source the
+	-- default Skills panel itself reads from) and add every non-header
+	-- skill name. This exists because GetProfessions() has been observed
+	-- to come back completely empty on Season of Discovery, almost
+	-- certainly because SoD's Rune Engraving system reshuffles the skill
+	-- list in a way that breaks the "professions always sit in these two
+	-- primary slots" assumption GetProfessions() relies on.
+	--
+	-- This adds non-profession skills too (weapon skills, languages,
+	-- riding, etc.), but that's harmless here: those names never match a
+	-- real recipe's item subtype, so they can't cause a false "this is
+	-- one of your professions" negative-tint result. Worth noting this
+	-- is intentionally a superset, not a replacement -- keeping
+	-- GetProfessions() first still gets us the fast, well-understood
+	-- path on every client where it actually works correctly.
+	if GetNumSkillLines and GetSkillLineInfo then
+		for i = 1, GetNumSkillLines() do
+			local skillName, isHeader = GetSkillLineInfo(i)
+			if skillName and not isHeader then
+				knownProfessions[skillName:lower()] = true
+			end
+		end
+	end
+end
+
+-- Re-check known professions shortly after the initial login snapshot,
+-- as a safety net against any residual case where profession data isn't
+-- fully populated on the client yet at the moment PLAYER_ENTERING_WORLD
+-- fires (e.g. very first login of a session). Cheap to run twice; wrong
+-- once is what causes false "unknown profession" blue tints.
+local function RefreshKnownProfessionsDelayed()
+	RefreshKnownProfessions()
+	if C_Timer and C_Timer.After then
+		C_Timer.After(2, RefreshKnownProfessions)
 	end
 end
 
@@ -905,6 +946,24 @@ SlashCmdList["BAGNONEXTRA"] = function(msg)
 		return
 	end
 
+	if msg == "profs" or msg == "professions" then
+		if not ENABLE_EXTRA_WARNINGS then
+			print("|cff33ff99BagnonExtra:|r the profession/class-token blue tint is off right now (it only runs when Bagnonium is loaded without Bagnon), so this list isn't in use.")
+			return
+		end
+		RefreshKnownProfessions() -- force a live read rather than showing a possibly-stale cache
+		print("|cff33ff99BagnonExtra:|r professions currently counted as \"known\" (recipes outside these get blue-tinted):")
+		local any = false
+		for name in pairs(knownProfessions) do
+			print("  " .. name)
+			any = true
+		end
+		if not any then
+			print("  (none detected -- if you do have a profession, try '/reload' and check again; if it's still empty afterwards, that's a bug, not a missing profession.)")
+		end
+		return
+	end
+
 	print("|cff33ff99BagnonExtra:|r button prefix diagnostics (which of these are real on your client):")
 	for _, prefix in ipairs(BUTTON_PREFIXES) do
 		local count = 0
@@ -922,6 +981,7 @@ SlashCmdList["BAGNONEXTRA"] = function(msg)
 		end
 	end
 	print("Use '/bagnonextra debug' to toggle verbose logging (forced rescan queue size, which bank tooltip branch fires).")
+	print("Use '/bagnonextra profs' to see which professions are currently detected as yours (for the recipe blue-tint feature).")
 end
 
 -----------------------------------------------------------
@@ -967,7 +1027,7 @@ if ENABLE_EXTRA_WARNINGS then
 	-- Only needed to keep the known-professions cache current; skipped
 	-- entirely when this feature set isn't active.
 	TryRegisterEvent(eventFrame, "SKILL_LINES_CHANGED")
-	RefreshKnownProfessions()
+	RefreshKnownProfessionsDelayed()
 end
 
 local forceScanPending = false
@@ -990,8 +1050,19 @@ local function RequestForceScan()
 end
 
 eventFrame:SetScript("OnEvent", function(self, event)
+	-- SKILL_LINES_CHANGED covers gaining/losing skill points during play.
+	-- PLAYER_ENTERING_WORLD covers login/reload: the very first
+	-- RefreshKnownProfessions() call above runs at file-load time, before
+	-- the client has actually received the character's profession data
+	-- from the server, so that first snapshot is frequently empty. Without
+	-- this, a character's own known professions would get wrongly blue-
+	-- tinted as "unknown" for the entire session, or until they happened
+	-- to skill up. RefreshKnownProfessionsDelayed() also re-checks a
+	-- couple seconds later as a safety net for slower initial logins.
 	if ENABLE_EXTRA_WARNINGS and event == "SKILL_LINES_CHANGED" then
 		RefreshKnownProfessions()
+	elseif ENABLE_EXTRA_WARNINGS and event == "PLAYER_ENTERING_WORLD" then
+		RefreshKnownProfessionsDelayed()
 	end
 	RequestForceScan()
 end)
@@ -1010,4 +1081,3 @@ else
 		end
 	end)
 end
-
