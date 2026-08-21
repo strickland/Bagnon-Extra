@@ -5,7 +5,9 @@
 ## DefaultState: enabled
 ## LoadOnDemand: 0
 ## OptionalDeps: Bagnon, Bagnonium
+## SavedVariables: BagnonExtraDB
 ## X-Category: Inventory
 main.lua
+
 
 
