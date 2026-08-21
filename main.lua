@@ -30,88 +30,23 @@
 	   label in the same bottom-left corner (mutually exclusive with
 	   #6 -- an item is never both).
 
-	Implementation notes:
+	8) Consumables (potions, elixirs, flasks, food, throwables, etc.)
+	   get a purple'ish star icon in the top-left corner, on by default
+	   for every item the game itself classifies as a Consumable.
 
-	- Bagnon and Bagnonium share the same underlying engine (Wildpants,
-	  formerly BagBrother), so their item buttons follow the same
-	  "<Prefix><index>" naming convention, just with a different addon
-	  name as the prefix (e.g. "BagnonContainerItem25"). We build the
-	  prefix list from whichever of the two addons is actually loaded.
-	  Bagnonium was formerly named Combuctor, so its legacy prefix is
-	  included as a fallback in case any frame names still carry it.
+	9) That default can be overridden per item: "/bagnonextra ignore"
+	   while hovering a consumable removes its star; "/bagnonextra add"
+	   while hovering a non-consumable forces one on. Running either
+	   command again on the same item undoes it. Overrides persist
+	   across sessions (SavedVariables).
 
-	  NOTE: only "ContainerItem" and "BankItem" have been confirmed
-	  against real Bagnon frame names (e.g. BagnonContainerItem126).
-	  "ReagentItem" and "VaultItem" are educated guesses at naming and
-	  have NOT been confirmed to exist as real Bagnon/Bagnonium frame
-	  prefixes -- reagent bank slots may simply be numbered as part of
-	  BankItem instead. They're harmless if wrong (see the fast-path
-	  check in QueueButtonsForForceScan below, which just finds nothing
-	  and moves on), but run "/bagnonextra" in-game to see exactly which
-	  prefixes resolve to real buttons on your client before assuming
-	  reagent bank / warband bank items are actually being covered.
+	10) "/bagnonextra favorite" or you can also use "/bagnonextra fav"
+	    while hovering any item marks it with a yellow star instead 
+            -- independent of whether it's a consom or not. 
+            A favorited item always shows the yellow star rather
+	    than the purple one.
 
-	- We read buttons directly (button.bag / button:GetID()) rather
-	  than through Bagnon/Bagnonium's internal plugin classes, since
-	  those class names have shifted across versions and skins.
 
-	- The "locked" field from GetContainerItemInfo/C_Container.
-	  GetContainerItemInfo is a SERVER lock flag (brief drag-lock during
-	  item moves, rare server-managed locked caches). It does NOT cover
-	  ordinary lockboxes/junkboxes you simply lack the lockpicking skill
-	  or key for -- those only reveal their locked status as a plain
-	  "Locked" line of tooltip text, which we scan for as well.
-
-	- There's no clean boolean API for "can I equip this item right
-	  now" that covers professions/zones/factions all at once. Blizzard
-	  already colors the failing requirement line red in the tooltip
-	  itself, so feature #5 detects that color directly rather than
-	  trying to special-case every requirement type.
-
-	- Only works against your OWN live bags and bank (while at a
-	  banker). Viewing a cached/other character (e.g. right-clicking to
-	  an alt via BagBrother) is explicitly skipped via the item
-	  button's own IsCached() check -- container queries like
-	  GetContainerItemInfo always read your currently logged-in
-	  character's live bags, so without that guard a cached button
-	  would get tinted using an unrelated item from your own bags at
-	  the same bag/slot number.
-
-	- The main bank container's slots are special "inventory slots"
-	  under the hood, handled via SetInventoryItem/BankButtonIDToInvSlotID
-	  instead of SetBagItem (see ScanTooltip). This was accurate for the
-	  pre-Dragonflight bank. Blizzard has since reworked the retail bank
-	  so that its tabs behave like ordinary bag containers; it's not
-	  confirmed whether the old inventory-slot special case still ever
-	  triggers on current retail, or whether it's now dead code. Turn on
-	  debug mode ("/bagnonextra debug") and open your bank once to see
-	  which branch actually fires on your client -- do this before
-	  assuming bank-item detection works correctly on retail.
-
-	- Performance: scanning an item's tooltip is the expensive part of
-	  this addon. Each button caches a lightweight numeric fingerprint
-	  of its current item (no table allocation) and only does the real
-	  work -- fetching the full item link and scanning its tooltip --
-	  when that fingerprint changes, or when a relevant game event (bag
-	  update, profession learned) forces a full refresh. A once-a-second
-	  safety-net timer catches anything event-driven updates might miss,
-	  but reuses the same cheap fingerprint check so it costs almost
-	  nothing when bags are sitting idle. The profession/class-token
-	  checks are skipped entirely (no extra cost at all) unless
-	  Bagnonium-without-Bagnon is actually detected.
-
-	  Forced rescans (the kind that skip the fingerprint cache and
-	  re-scan every visible item's tooltip) are spread across multiple
-	  frames in small chunks rather than done in one synchronous pass.
-	  A single-frame full rescan is cheap enough to be invisible on
-	  Classic/SoD/MoP (fewer bag slots, short tooltips), but on retail
-	  the combination of more total slots (backpack + 4 bags + the
-	  dedicated reagent bag) and much longer per-item tooltips (item
-	  level, crafted stats, sockets, set bonuses, upgrade track, etc.)
-	  can turn one synchronous forced rescan into a visible CPU peak the
-	  instant you open your bags, even though total/sustained addon CPU
-	  stays low. Chunking the same work across several frames keeps the
-	  total cost identical but removes the single-frame spike.
 ]]
 
 local hasBagnon = _G.Bagnon ~= nil
@@ -136,6 +71,13 @@ local WARNING_COLOR     = { r = 0.10, g = 0.35, b = 0.95, a = 0.55 } -- blue tai
 local RESTRICTION_COLOR = { r = 1.00, g = 0.35, b = 0.65, a = 0.45 } -- clear pink taint for gear you can't equip (profession/zone/etc requirement not met)
 local OPENABLE_COLOR    = { r = 1.00, g = 0.85, b = 0.10, a = 1.00 } -- yellow "OPN" text for openable caches/chests
 local LEARNABLE_COLOR   = { r = 1.00, g = 0.60, b = 0.10, a = 1.00 } -- bright orange "LRN" text for learnable mounts/pets/toys
+-- Light pink/lavender star for consumables. The texture is desaturated
+-- to grayscale before this tint is applied (see GetStarIcon), which is
+-- what makes a real light color reachable here rather than the dark
+-- maroon a straight tint of the gold original would cap out at.
+local CONSUMABLE_COLOR  = { r = 0.95, g = 0.55, b = 0.95, a = 1.00 }
+local FAVORITE_COLOR    = { r = 1.00, g = 0.85, b = 0.15, a = 1.00 } -- gold/yellow star for favorited items
+local STAR_TEXTURE = "Interface\\TargetingFrame\\UI-RaidTargetingIcon_1"
 local CHARGE_FONT_SIZE = 12
 
 local LOCKED_STRING = _G.LOCKED -- localized "Locked", used by Blizzard's own UI elsewhere
@@ -146,6 +88,7 @@ local PROFESSION_CLASS_ID = Enum and Enum.ItemClass and Enum.ItemClass.Professio
 local ARMOR_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Armor) or 4
 local WEAPON_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Weapon) or 2
 local MISC_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Miscellaneous) or 15
+local CONSUMABLE_CLASS_ID = (Enum and Enum.ItemClass and Enum.ItemClass.Consumable) or 0
 
 -- Prefer the named Enum over hardcoded numeric literals, same pattern
 -- already used above for RECIPE/ARMOR/WEAPON/MISC class IDs. Guards
@@ -168,6 +111,38 @@ local FORCE_SCAN_CHUNK_SIZE = 25 -- buttons processed per frame during a forced 
 local REQUIREMENT_RED_MIN_R = 0.75
 local REQUIREMENT_RED_MAX_G = 0.35
 local REQUIREMENT_RED_MAX_B = 0.35
+
+-----------------------------------------------------------
+-- Persistent per-item star overrides (SavedVariables)
+--
+-- BagnonExtraDB must be a plain global (not local) for the client's
+-- SavedVariables system to find and persist it -- it's populated from
+-- disk automatically before this addon's ADDON_LOADED fires, so by the
+-- time InitializeDB() runs below, any previously-saved data is already
+-- present and just needs its substructure defaulted if missing (first
+-- ever run, or an old save from before a given table existed).
+--
+-- consumableOverride[itemID] = true  -> force the purple star on even
+--                                        though the item isn't a
+--                                        Consumable ("/bagnonextra add")
+-- consumableOverride[itemID] = false -> force the purple star off even
+--                                        though the item IS a
+--                                        Consumable ("/bagnonextra ignore")
+-- consumableOverride[itemID] = nil   -> no override; default behavior
+--                                        (star shows iff IsConsumable)
+--
+-- favorites[itemID] = true -> yellow star, regardless of the above.
+-- A favorited item shows yellow, never purple, even if it's also a
+-- consumable -- see the priority order in ApplyVisuals.
+-----------------------------------------------------------
+
+BagnonExtraDB = BagnonExtraDB or {}
+
+local function InitializeDB()
+	BagnonExtraDB.consumableOverride = BagnonExtraDB.consumableOverride or {}
+	BagnonExtraDB.favorites = BagnonExtraDB.favorites or {}
+end
+InitializeDB()
 
 -----------------------------------------------------------
 -- Debug mode: "/bagnonextra" prints which button prefixes resolve to
@@ -241,6 +216,74 @@ local function GetChargeText(button)
 		button.ExtraChargeText = fs
 	end
 	return fs
+end
+
+-- Top-left star icon: purple for consumables, yellow for favorited
+-- items (favorite takes priority when an item is both -- see
+-- ApplyVisuals). Uses the client's built-in raid-target-marker star
+-- texture (UI-RaidTargetingIcon_1) rather than a Unicode "★" glyph --
+-- Classic Era's default UI fonts don't include that glyph and render
+-- it as a blank box, but this texture has shipped with every client
+-- flavor since Vanilla, so it's a safer cross-version choice than
+-- depending on font coverage. Color is set dynamically per-call in
+-- ApplyVisuals (same pattern as the OPN/LRN status text below), not
+-- fixed at creation, since which color applies can change per item.
+local STAR_SIZE = 14 -- was 10; small enough not to dominate the icon, big enough to actually read at a glance
+local STAR_OUTLINE_PADDING = 4 -- how much larger the dark backing shape is than the colored star on top of it
+
+local function GetStarIcon(button)
+	local tex = button.ExtraStarIcon
+	if not tex then
+		tex = button:CreateTexture(nil, "OVERLAY")
+		tex:SetSize(STAR_SIZE, STAR_SIZE)
+		tex:SetPoint("TOPLEFT", button, "TOPLEFT", 2, -2)
+		tex:SetTexture(STAR_TEXTURE)
+		-- Desaturate to neutral grayscale BEFORE tinting. The star's
+		-- native gold has almost no blue channel, so tinting the
+		-- untouched original caps out at dark red/maroon no matter what
+		-- color is requested (a multiply can't add a channel that isn't
+		-- there). A grayscale base has roughly equal R/G/B, so tinting
+		-- it can reproduce a real light pink/purple instead. Guarded
+		-- since SetDesaturation needs shader support; falls back to the
+		-- gold-tinted (murkier) look on any client/hardware without it,
+		-- rather than erroring.
+		if tex.SetDesaturation then
+			tex:SetDesaturation(1)
+		end
+		tex:SetDrawLayer("OVERLAY", 7)
+
+		-- Dark backing copy: same star shape, tinted near-black and
+		-- slightly larger, drawn one sublevel behind the colored star so
+		-- it reads as a rim/outline around it. Same purpose the OUTLINE
+		-- font flag already serves for the charge/status text elsewhere
+		-- in this addon -- keeps the icon readable against item icons of
+		-- any color or brightness underneath it, rather than the colored
+		-- shape alone potentially blending into a busy background.
+		local outline = button:CreateTexture(nil, "OVERLAY")
+		outline:SetSize(STAR_SIZE + STAR_OUTLINE_PADDING, STAR_SIZE + STAR_OUTLINE_PADDING)
+		outline:SetPoint("CENTER", tex, "CENTER", 0, 0)
+		outline:SetTexture(STAR_TEXTURE)
+		outline:SetVertexColor(0, 0, 0)
+		outline:SetDrawLayer("OVERLAY", 6)
+		tex.Outline = outline
+
+		button.ExtraStarIcon = tex
+	end
+	return tex
+end
+
+-- Shows/hides the star and its outline together -- always go through
+-- these two rather than calling :Show()/:Hide() directly on the
+-- texture returned by GetStarIcon, or the outline will fall out of
+-- sync with it.
+local function ShowStarIcon(tex)
+	tex.Outline:Show()
+	tex:Show()
+end
+
+local function HideStarIcon(tex)
+	tex.Outline:Hide()
+	tex:Hide()
 end
 
 -- Bottom-left status label: "OPN" (yellow) for openable caches/chests,
@@ -357,7 +400,27 @@ local function NameSuggestsOpenable(name)
 	return false
 end
 
-local function ScanTooltipLines()
+-- Restricts the name-based openable guess above to items the game
+-- itself classifies as Miscellaneous -- the item class real lootable
+-- containers (footlockers, junk boxes, treasure caches) are almost
+-- always filed under. This excludes false positives the name alone
+-- can't catch: a passive quest charm like [Cache of Mau'ari] (item
+-- class Quest, not a container at all despite the name), or a
+-- "Use:"-effect consumable like [Flash Bundle] (item class Consumable,
+-- an AoE fire effect, not something you loot open). Doesn't touch the
+-- real "Right Click to Open" tooltip detection above, which stays
+-- unconditional and authoritative -- this only narrows the guess used
+-- when that text is missing.
+local function ItemClassAllowsNameGuess(itemLink)
+	local getInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+	if not getInstant or not itemLink then
+		return true -- can't check -- don't lose the guess entirely, just can't narrow it
+	end
+	local _, _, _, _, _, itemClassID = getInstant(itemLink)
+	return itemClassID == MISC_CLASS_ID
+end
+
+local function ScanTooltipLines(itemLink)
 	local isLockedText = false
 	local charges = nil
 	local classesLine = nil
@@ -414,14 +477,14 @@ local function ScanTooltipLines()
 		end
 	end
 
-	if not isOpenable then
-		isOpenable = NameSuggestsOpenable(itemNameLine)
+	if not isOpenable and NameSuggestsOpenable(itemNameLine) and ItemClassAllowsNameGuess(itemLink) then
+		isOpenable = true
 	end
 
 	return isLockedText, charges, classesLine, hasFailedRequirement, isOpenable
 end
 
-local function ScanTooltip(bag, slot)
+local function ScanTooltip(bag, slot, itemLink)
 	Scanner:SetOwner(WorldFrame, "ANCHOR_NONE")
 	Scanner:ClearLines()
 
@@ -449,7 +512,7 @@ local function ScanTooltip(bag, slot)
 		Scanner:SetBagItem(bag, slot)
 	end
 
-	return ScanTooltipLines()
+	return ScanTooltipLines(itemLink)
 end
 
 -----------------------------------------------------------
@@ -642,6 +705,20 @@ local function IsLearnableItem(itemLink)
 	return false
 end
 
+-- True for any item classified as a Consumable (potions, elixirs,
+-- flasks, food, bandages, fireworks, throwable "Use:" items like Flash
+-- Bundle, etc.) -- a plain item-class check, no tooltip dependency, so
+-- it's cheap and works the same on every client flavor.
+local function IsConsumable(itemLink)
+	local getInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+	if not getInstant then
+		return false -- extremely old client without this API; feature just no-ops
+	end
+
+	local _, _, _, _, _, itemClassID = getInstant(itemLink)
+	return itemClassID == CONSUMABLE_CLASS_ID
+end
+
 -----------------------------------------------------------
 -- Apply visuals to a button, given its bag/slot/item link
 -----------------------------------------------------------
@@ -651,8 +728,9 @@ local function ApplyVisuals(button, bag, slot, itemLink)
 	local chargeText = GetChargeText(button)
 	local restrictionTint = GetRestrictionTint(button)
 	local statusText = GetStatusText(button)
+	local starIcon = GetStarIcon(button)
 
-	local lockedText, charges, classesLine, hasFailedRequirement, isOpenable = ScanTooltip(bag, slot)
+	local lockedText, charges, classesLine, hasFailedRequirement, isOpenable = ScanTooltip(bag, slot, itemLink)
 
 	if lockedText then
 		overlay:Show()
@@ -672,6 +750,37 @@ local function ApplyVisuals(button, bag, slot, itemLink)
 		restrictionTint:Show()
 	else
 		restrictionTint:Hide()
+	end
+
+	-- Star priority: favorite (yellow) beats any consumable override,
+	-- which beats the default IsConsumable() check. Only one star can
+	-- show at a time, so a favorited consumable shows yellow, not
+	-- purple -- favoriting is the more specific, explicit user choice.
+	do
+		local itemID = GetQuickItemID(bag, slot)
+		local isFavorited = itemID and BagnonExtraDB.favorites[itemID]
+		local override = itemID and BagnonExtraDB.consumableOverride[itemID]
+
+		local showStar, starColor
+		if isFavorited then
+			showStar, starColor = true, FAVORITE_COLOR
+		elseif override == true then
+			showStar, starColor = true, CONSUMABLE_COLOR
+		elseif override == false then
+			showStar = false
+		elseif IsConsumable(itemLink) then
+			showStar, starColor = true, CONSUMABLE_COLOR
+		else
+			showStar = false
+		end
+
+		if showStar then
+			starIcon:SetVertexColor(starColor.r, starColor.g, starColor.b)
+			starIcon:SetAlpha(starColor.a)
+			ShowStarIcon(starIcon)
+		else
+			HideStarIcon(starIcon)
+		end
 	end
 
 	-- OPN and LRN are mutually exclusive on any real item, so one
@@ -709,6 +818,7 @@ local function ClearVisuals(button)
 	local warningTint = button.ExtraWarningTint
 	local restrictionTint = button.ExtraRestrictionTint
 	local statusText = button.ExtraStatusText
+	local starIcon = button.ExtraStarIcon
 
 	if overlay then
 		overlay:Hide()
@@ -719,6 +829,9 @@ local function ClearVisuals(button)
 	end
 	if warningTint then
 		warningTint:Hide()
+	end
+	if starIcon then
+		HideStarIcon(starIcon)
 	end
 	if restrictionTint then
 		restrictionTint:Hide()
@@ -933,6 +1046,45 @@ local function QueueButtonsForForceScan()
 end
 
 -----------------------------------------------------------
+-- Hover-target resolution for the ignore/add/favorite commands
+-----------------------------------------------------------
+
+-- Returns the item under the mouse cursor right now (itemID, display
+-- name, itemLink), or nil if the cursor isn't over one of our tracked
+-- item buttons or the slot is empty. GetMouseFoci() replaced the older
+-- GetMouseFocus() at some point in retail; both are checked here so
+-- this works across every client flavor rather than assuming one or
+-- the other exists.
+local function GetHoveredItem()
+	local focus
+	if GetMouseFoci then
+		local foci = GetMouseFoci()
+		focus = foci and foci[1]
+	elseif GetMouseFocus then
+		focus = GetMouseFocus()
+	end
+
+	if not focus then
+		return nil
+	end
+
+	local bag = focus.bag or (focus.GetBagID and focus:GetBagID())
+	local slot = focus.GetID and focus:GetID()
+	if not bag or not slot then
+		return nil -- not one of our item buttons
+	end
+
+	local itemID = GetQuickItemID(bag, slot)
+	if not itemID then
+		return nil -- empty slot
+	end
+
+	local itemLink = GetContainerItemLink(bag, slot)
+	local itemName = (itemLink and GetItemInfoCompat(itemLink)) or ("item " .. itemID)
+	return itemID, itemName, itemLink
+end
+
+-----------------------------------------------------------
 -- Diagnostics slash command
 -----------------------------------------------------------
 
@@ -964,6 +1116,66 @@ SlashCmdList["BAGNONEXTRA"] = function(msg)
 		return
 	end
 
+	if msg == "ignore" then
+		local itemID, itemName, itemLink = GetHoveredItem()
+		if not itemID then
+			print("|cff33ff99BagnonExtra:|r hover over an item in your bags, then run '/bagnonextra ignore'.")
+			return
+		end
+		local override = BagnonExtraDB.consumableOverride[itemID]
+		if override == false then
+			-- already ignored -> toggle back to default behavior
+			BagnonExtraDB.consumableOverride[itemID] = nil
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " will use the default star behavior again.")
+		elseif override == true or IsConsumable(itemLink) then
+			-- currently showing a star (forced on, or a natural consumable) -> hide it
+			BagnonExtraDB.consumableOverride[itemID] = false
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " will no longer be starred.")
+		else
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " isn't a consumable, so there's nothing to ignore. Use '/bagnonextra add' if you want to force a star onto it instead.")
+		end
+		QueueButtonsForForceScan()
+		return
+	end
+
+	if msg == "add" then
+		local itemID, itemName, itemLink = GetHoveredItem()
+		if not itemID then
+			print("|cff33ff99BagnonExtra:|r hover over an item in your bags, then run '/bagnonextra add'.")
+			return
+		end
+		local override = BagnonExtraDB.consumableOverride[itemID]
+		if override == true then
+			-- already force-added -> toggle back to default behavior
+			BagnonExtraDB.consumableOverride[itemID] = nil
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " will use the default star behavior again.")
+		elseif override ~= false and IsConsumable(itemLink) then
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " is already a consumable and already gets the star automatically. Use '/bagnonextra ignore' if you want to remove it instead.")
+		else
+			BagnonExtraDB.consumableOverride[itemID] = true
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " will now be starred.")
+		end
+		QueueButtonsForForceScan()
+		return
+	end
+
+	if msg == "favorite" or msg == "fav" then
+		local itemID, itemName = GetHoveredItem()
+		if not itemID then
+			print("|cff33ff99BagnonExtra:|r hover over an item in your bags, then run '/bagnonextra favorite'.")
+			return
+		end
+		if BagnonExtraDB.favorites[itemID] then
+			BagnonExtraDB.favorites[itemID] = nil
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " removed from favorites.")
+		else
+			BagnonExtraDB.favorites[itemID] = true
+			print("|cff33ff99BagnonExtra:|r " .. itemName .. " marked as a favorite (yellow star).")
+		end
+		QueueButtonsForForceScan()
+		return
+	end
+
 	print("|cff33ff99BagnonExtra:|r button prefix diagnostics (which of these are real on your client):")
 	for _, prefix in ipairs(BUTTON_PREFIXES) do
 		local count = 0
@@ -982,6 +1194,7 @@ SlashCmdList["BAGNONEXTRA"] = function(msg)
 	end
 	print("Use '/bagnonextra debug' to toggle verbose logging (forced rescan queue size, which bank tooltip branch fires).")
 	print("Use '/bagnonextra profs' to see which professions are currently detected as yours (for the recipe blue-tint feature).")
+	print("Hover an item and use '/bagnonextra ignore' or '/bagnonextra add' to override its purple consumable star, or '/bagnonextra favorite' for a yellow one.")
 end
 
 -----------------------------------------------------------
@@ -1049,6 +1262,19 @@ local function RequestForceScan()
 	C_Timer.After(0.15, RunPendingForceScan)
 end
 
+-- Printed once per session, a few seconds after PLAYER_ENTERING_WORLD
+-- rather than immediately at login -- login already floods chat with
+-- other addons' own messages, so a short delay makes this actually
+-- visible instead of scrolling past unread.
+local hasShownLoginReminder = false
+local function ShowLoginReminder()
+	if hasShownLoginReminder then
+		return
+	end
+	hasShownLoginReminder = true
+	print("|cff33ff99BagnonExtra:|r tip: hover an item and run '/bagnonextra ignore' or '/bagnonextra add' to override its purple consumable star, or '/bagnonextra favorite' for a yellow one.")
+end
+
 eventFrame:SetScript("OnEvent", function(self, event)
 	-- SKILL_LINES_CHANGED covers gaining/losing skill points during play.
 	-- PLAYER_ENTERING_WORLD covers login/reload: the very first
@@ -1059,10 +1285,19 @@ eventFrame:SetScript("OnEvent", function(self, event)
 	-- tinted as "unknown" for the entire session, or until they happened
 	-- to skill up. RefreshKnownProfessionsDelayed() also re-checks a
 	-- couple seconds later as a safety net for slower initial logins.
-	if ENABLE_EXTRA_WARNINGS and event == "SKILL_LINES_CHANGED" then
-		RefreshKnownProfessions()
-	elseif ENABLE_EXTRA_WARNINGS and event == "PLAYER_ENTERING_WORLD" then
-		RefreshKnownProfessionsDelayed()
+	if event == "SKILL_LINES_CHANGED" then
+		if ENABLE_EXTRA_WARNINGS then
+			RefreshKnownProfessions()
+		end
+	elseif event == "PLAYER_ENTERING_WORLD" then
+		if ENABLE_EXTRA_WARNINGS then
+			RefreshKnownProfessionsDelayed()
+		end
+		if C_Timer and C_Timer.After then
+			C_Timer.After(5, ShowLoginReminder)
+		else
+			ShowLoginReminder() -- no timer API available; just show it immediately rather than never
+		end
 	end
 	RequestForceScan()
 end)
@@ -1081,3 +1316,4 @@ else
 		end
 	end)
 end
+
